@@ -11,7 +11,7 @@ AUTHOR
   Bug reports, comments, and suggestions are always welcome.
 
 COPYRIGHT
-  Original code © 2010 Microsoft Corporation. All rights reserved.
+  Original code (C) 2010 Microsoft Corporation. All rights reserved.
   From http://msdn.microsoft.com/en-us/library/aa366789%28v=vs.85%29.aspx
 
   Changes copyright (C) 2011 by Roger Orr mailto:rogero@howzatt.co.uk
@@ -180,3 +180,4 @@ std::string GetFileNameFromHandle(HANDLE hFile) {
   }
   return result;
 }
+

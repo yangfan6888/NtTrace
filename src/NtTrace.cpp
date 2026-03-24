@@ -143,6 +143,26 @@ public:
   void setShowLoaderSnaps(bool b) { bShowLoaderSnaps_ = b; }
 
   /**
+   * Set the 'debug string' flag.
+   * @param b the new value: if false OutputDebugString messages are suppressed
+   */
+  void setLogDebugStrings(bool b) { bLogDebugStrings_ = b; }
+
+  /**
+   * Set the 'one-shot breakpoint' flag.
+   * @param b the new value: if true each traced entry point is removed after
+   * the first post-call breakpoint hit
+   */
+  void setOneShot(bool b) { bOneShot_ = b; }
+
+  /**
+   * Set the 'stop on first hit' flag.
+   * @param b the new value: if true detach after the first traced breakpoint
+   * hit
+   */
+  void setStopOnFirst(bool b) { bStopOnFirst_ = b; }
+
+  /**
    * Set the categories
    * @param category a comma-delimited list of categories to trace
    */
@@ -184,6 +204,9 @@ private:
   bool bNoExcept_{false};
   bool bNoThread_{false};
   bool bShowLoaderSnaps_{false};
+  bool bLogDebugStrings_{true};
+  bool bOneShot_{false};
+  bool bStopOnFirst_{false};
   std::ostream &os_;
 
   bool bActive_{true};
@@ -220,6 +243,7 @@ private:
 
   bool OnBreakpoint(DWORD processId, DWORD threadId, HANDLE hProcess,
                     HANDLE hThread, LPVOID exceptionAddress);
+  bool clearOneShotBreakpoint(HANDLE hProcess, NtCall const &ntCall);
 
   void SetDllBreakpoints(HANDLE hProcess);
   void showUnused(std::set<std::string> const &unused, std::string const &name);
@@ -306,6 +330,8 @@ static bool bDelta(false);
 static bool bPid(false);
 static bool bTid(false);
 static bool bNewline(false);
+static bool bOneShot(false);
+static bool bStopOnFirst(false);
 static std::string configFile; // override default config file
 
 static std::string exportFile; // Export symbols here once loaded
@@ -481,6 +507,7 @@ bool TrapNtDebugger::OnBreakpoint(DWORD processId, DWORD threadId,
   }
   it = NtCalls_.find(exceptionAddress);
   if (it != NtCalls_.end()) {
+    NtCall const ntCall = it->second;
 #ifdef _M_IX86
     NTSTATUS rc = Context.Eax;
 #elif _M_X64
@@ -491,42 +518,67 @@ bool TrapNtDebugger::OnBreakpoint(DWORD processId, DWORD threadId,
     } else if (errorCodes.empty() || (errorCodes.count(rc) > 0)) {
       header(processId, threadId);
 
-      it->second.entryPoint_->trace(os_, hProcess, hThread, Context, bNames,
-                                    bStackTrace, false);
+      ntCall.entryPoint_->trace(os_, hProcess, hThread, Context, bNames,
+                                bStackTrace, false);
     }
 
-    if (it->second.trapType_ == NtCall::trapReturn ||
-        it->second.trapType_ == NtCall::trapReturn0) {
+    if (ntCall.trapType_ == NtCall::trapReturn ||
+        ntCall.trapType_ == NtCall::trapReturn0) {
       // Fake a return 'n'
 #ifdef _M_IX86
       DWORD eip = 0;
       ReadProcessMemory(hProcess, (LPVOID)(Context.Esp), &eip, sizeof(eip), 0);
 
       Context.Eip = eip;
-      Context.Esp += sizeof(eip) + it->second.nArgs_ * sizeof(DWORD);
+      Context.Esp += sizeof(eip) + ntCall.nArgs_ * sizeof(DWORD);
 #elif _M_X64
       DWORD64 rip = 0;
       ReadProcessMemory(hProcess, (LPVOID)(Context.Rsp), &rip, sizeof(rip),
                         nullptr);
 
       Context.Rip = rip;
-      Context.Rsp += sizeof(rip) + it->second.nArgs_ * sizeof(DWORD);
+      Context.Rsp += sizeof(rip) + ntCall.nArgs_ * sizeof(DWORD);
 #endif // _M_IX86
-    } else if (it->second.trapType_ == NtCall::trapJump) {
+    } else if (ntCall.trapType_ == NtCall::trapJump) {
       // Fake a jump
 #ifdef _M_IX86
-      Context.Eip = it->second.jumpTarget_;
+      Context.Eip = ntCall.jumpTarget_;
 #elif _M_X64
-      Context.Rip = it->second.jumpTarget_;
+      Context.Rip = ntCall.jumpTarget_;
 #endif // _M_IX86
     }
     Context.ContextFlags = CONTEXT_CONTROL;
     if (!SetThreadContext(hThread, &Context)) {
       os_ << "Can't set thread context: " << displayError() << std::endl;
     }
+
+    if (bOneShot_) {
+      if (!clearOneShotBreakpoint(hProcess, ntCall)) {
+        std::cerr << "Cannot clear one-shot trap for "
+                  << ntCall.entryPoint_->getName() << std::endl;
+      } else {
+        NtCalls_.erase(it);
+        unsigned char *preSave = ntCall.entryPoint_->getPreSave();
+        if (preSave != nullptr) {
+          NtPreSave_.erase(preSave);
+        }
+      }
+    }
+    if (bStopOnFirst_) {
+      detachAll();
+    }
     return true; // Breakpoint handled
   }
   return false; // Not an NtTrace breakpoint
+}
+
+bool TrapNtDebugger::clearOneShotBreakpoint(HANDLE hProcess,
+                                            NtCall const &ntCall) {
+  if (!ntCall.entryPoint_->clearNtTrap(hProcess, ntCall)) {
+    return false;
+  }
+  FlushInstructionCache(hProcess, nullptr, 0);
+  return true;
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -760,6 +812,9 @@ void TrapNtDebugger::OnUnloadDll(DWORD processId, DWORD threadId,
 void TrapNtDebugger::OnOutputDebugString(
     DWORD processId, DWORD threadId, HANDLE hProcess,
     OUTPUT_DEBUG_STRING_INFO const &DebugString) {
+  if (!bLogDebugStrings_) {
+    return;
+  }
   if (bNewline) {
     // If we're not adding newlines then the header is simply confusing
     header(processId, threadId);
@@ -1012,6 +1067,7 @@ int main(int argc, char **argv) {
   bool bNoDlls(false);
   bool bNoExcept(false);
   bool bNoThread(false);
+  bool bNoDebugString(false);
   bool noDebugHeap(false);
   bool bNoNames(false);
   bool bShowLoaderSnaps(false);
@@ -1036,11 +1092,17 @@ int main(int argc, char **argv) {
   options.set("hd", &noDebugHeap, "Don't use debug heap");
   options.set("nonames", &bNoNames, "Don't name arguments");
   options.set("nodlls", &bNoDlls, "Don't process DLL load/unload");
+  options.set("nodebugstr", &bNoDebugString,
+              "Don't process OutputDebugString messages");
   options.set("noexcept", &bNoExcept, "Don't process exceptions");
   options.set("nothread", &bNoThread, "Don't process thread creation or exit");
   options.set("only", &bOnly,
               "Only debug the first process, don't debug child processes");
+  options.set("first", &bStopOnFirst,
+              "Detach and stop after the first traced breakpoint hit");
   options.set("out", &outputFile, "Output file");
+  options.set("once", &bOneShot,
+              "Remove each traced breakpoint after its first hit");
   options.set("pre", &bPreTrace, "Trace pre-call as well as post-call");
   options.set("stack", &bStackTrace, "show stack trace");
   options.set("time", &bTimestamp, "show timestamp");
@@ -1074,9 +1136,12 @@ int main(int argc, char **argv) {
   TrapNtDebugger debugger((outputFile.length() != 0) ? (std::ostream &)ofs
                                                      : std::cout);
   debugger.setLogDlls(!bNoDlls);
+  debugger.setLogDebugStrings(!bNoDebugString);
   debugger.setNoException(bNoExcept);
   debugger.setNoThread(bNoThread);
   debugger.setShowLoaderSnaps(bShowLoaderSnaps);
+  debugger.setOneShot(bOneShot);
+  debugger.setStopOnFirst(bStopOnFirst);
   debugger.setFilter(filter);
   debugger.setCategory(category);
 
